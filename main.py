@@ -1,135 +1,87 @@
 import requests
 from bs4 import BeautifulSoup
-from concurrent.futures import ThreadPoolExecutor
-from urllib.robotparser import RobotFileParser
-from pymongo import MongoClient
+from collections import deque
+import json
 import time
-import random
+from urllib.parse import urljoin
 
-START_URLS = ["https://www.idnes.cz"]
-MAX_URLS = 1000
-MONGO_DB_NAME = "news_data"
-MONGO_COLLECTION_NAME = "articles"
-HEADERS = {
-    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36"
-}
-
-# MongoDB setup
-client = MongoClient("mongodb://localhost:27017/")
-db = client[MONGO_DB_NAME]
-collection = db[MONGO_COLLECTION_NAME]
-
-def is_allowed(base_url, url):
-    """Check if crawling is allowed by robots.txt."""
-    rp = RobotFileParser()
-    rp.set_url(f"{base_url}/robots.txt")
+# Function to download the page content
+def fetch_page(url):
     try:
-        rp.read()
-        return rp.can_fetch("*", url)
-    except Exception as e:
-        print(f"Error reading robots.txt: {e}")
-        return False
-
-def is_valid_article_url(url):
-    """Filter out non-article links."""
-    if not url.startswith("https://www.idnes.cz"):
-        return False
-    if 'fotogalerie' in url or 'diskuze' in url or 'video' in url:
-        return False
-    return True
-
-def collect_article_urls(base_url):
-    """Collect article URLs from the base domain."""
-    collected_urls = []
-    to_visit = [base_url]
-    visited_urls = set()
-
-    while to_visit and len(collected_urls) < MAX_URLS:
-        current_url = to_visit.pop(0)
-        if current_url in visited_urls:
-            continue
-        visited_urls.add(current_url)
-
-        if not is_allowed(base_url, current_url):
-            print(f"Crawling disallowed for {current_url}. Skipping...")
-            continue
-
-        try:
-            response = requests.get(current_url, headers=HEADERS)
-            response.raise_for_status()
-            soup = BeautifulSoup(response.text, 'html.parser')
-
-            for link in soup.find_all('a', href=True):
-                url = link['href']
-                if not url.startswith("http"):
-                    url = base_url + url
-
-                if is_valid_article_url(url) and url not in visited_urls:
-                    collected_urls.append(url)
-                    to_visit.append(url)
-        except Exception as e:
-            print(f"Error collecting URLs from {current_url}: {e}")
-
-    return collected_urls
-
-def scrape_article(url):
-    """Scrape article content from a URL."""
-    try:
-        response = requests.get(url, headers=HEADERS)
-        response.raise_for_status()
-        soup = BeautifulSoup(response.text, 'html.parser')
-
-        title = soup.find('h1').get_text(strip=True) if soup.find('h1') else 'No title'
-        category = soup.find('a', class_='category').get_text(strip=True) if soup.find('a', class_='category') else 'Unknown'
-        comments = len(soup.find_all('div', class_='comment'))
-        images = len(soup.find_all('img'))
-        content = ' '.join([p.get_text(strip=True) for p in soup.find_all('p')])
-        publication_date = soup.find('time')['datetime'] if soup.find('time') else 'Unknown'
-
-        return {
-            "url": url,
-            "title": title,
-            "category": category,
-            "comments": comments,
-            "images": images,
-            "content": content,
-            "publication_date": publication_date
-        }
-    except Exception as e:
-        print(f"Error scraping {url}: {e}")
+        # Send a GET request to the URL with a timeout of 10 seconds
+        response = requests.get(url, timeout=10)
+        response.raise_for_status()  # Raise an error if the request failed
+        return response.text  # Return the page content
+    except requests.RequestException as e:
+        # Print an error message if there was an issue fetching the page
+        print(f"Error fetching {url}: {e}")
         return None
 
-def scrape_multiple_urls_parallel(urls):
-    """Scrape multiple articles using parallel threads."""
-    with ThreadPoolExecutor(max_workers=10) as executor:
-        results = list(executor.map(scrape_article, urls))
-    return [res for res in results if res]
+# Function to parse the page content
+def parse_page(html, base_url):
+    soup = BeautifulSoup(html, 'html.parser')
+    article_data = {}
+    
+    # Extract the title of the article, assuming it's in an <h1> tag
+    title_tag = soup.find('h1')
+    if title_tag:
+        article_data['title'] = title_tag.get_text(strip=True)
+    
+    # Extract the date of the article, assuming it's in a <time> tag
+    date_tag = soup.find('time')
+    if date_tag:
+        article_data['date'] = date_tag.get('datetime')
+    
+    # Extract the full article content from the div with id="content"
+    content_div = soup.find('div', id='content')
+    if content_div:
+        article_data['content'] = content_div.get_text(strip=True)
+    
+    # Count the number of images in the article
+    img_tags = content_div.find_all('img') if content_div else []
+    article_data['img_count'] = len(img_tags)
 
-def save_to_mongo(data):
-    """Save scraped data to MongoDB."""
-    if not data:
-        print("No data to save!")
-        return
-    collection.insert_many(data)
-    print(f"Data successfully saved to MongoDB in {MONGO_COLLECTION_NAME} collection.")
+    # Find all links on the page (anchor tags with href attributes)
+    links = [urljoin(base_url, a.get('href')) for a in soup.find_all('a', href=True)]
+    return article_data, links
 
-def rate_limit():
-    """Add a random delay between requests."""
-    time.sleep(random.uniform(1, 3))
+# Function to save the data to a JSON file
+def save_data(data, filename='articles.json'):
+    with open(filename, 'a', encoding='utf-8') as f:
+        json.dump(data, f, ensure_ascii=False)
+        f.write('\n')  # Write each JSON object on a new line
+
+# Main function to run the crawler
+def crawl(start_url, max_pages=100):
+    queue = deque([start_url])  # Queue to manage URLs to be visited
+    visited = set()  # Set to keep track of visited URLs
+    
+    while queue and len(visited) < max_pages:
+        current_url = queue.popleft()  # Get the next URL from the queue
+        if current_url in visited:
+            continue  # Skip if the URL has already been visited
+
+        print(f"Crawling: {current_url}")
+        html = fetch_page(current_url)  # Fetch the page content
+        if html is None:
+            continue  # Skip to the next URL if the page couldn't be fetched
+
+        article_data, links = parse_page(html, current_url)  # Parse the page content
+        if article_data:
+            save_data(article_data)  # Save the extracted article data
+
+        visited.add(current_url)  # Mark the current URL as visited
+        for link in links:
+            # Add new links to the queue if they haven't been visited
+            if link not in visited and link.startswith(('http://', 'https://')):
+                queue.append(link)
+        
+        time.sleep(1)  # Pause for 1 second between requests to avoid overwhelming the server
 
 if __name__ == "__main__":
-    all_collected_urls = []
-
-    for start_url in START_URLS:
-        print(f"Collecting URLs from {start_url}...")
-        urls = collect_article_urls(start_url)
-        all_collected_urls.extend(urls)
-        print(f"Collected {len(urls)} URLs from {start_url}")
-
-    print(f"Total collected URLs: {len(all_collected_urls)}")
-
-    print("Scraping data from articles...")
-    scraped_data = scrape_multiple_urls_parallel(all_collected_urls)
-
-    print("Saving data to MongoDB...")
-    save_to_mongo(scraped_data)
+    # List of starting URLs for the crawler
+    start_urls = [
+        "https://www.idnes.cz"
+    ]
+    for url in start_urls:
+        crawl(url, max_pages=500)  # Start crawling each URL with a maximum of 500 pages
