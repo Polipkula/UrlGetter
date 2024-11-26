@@ -4,9 +4,7 @@ import csv
 from concurrent.futures import ThreadPoolExecutor
 
 START_URLS = [
-    "https://www.novinky.cz",  
-    "https://www.idnes.cz",    
-    "https://www.ctk.cz"  
+    "https://www.idnes.cz"
 ]
 
 MAX_URLS = 1000  
