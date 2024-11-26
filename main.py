@@ -46,7 +46,7 @@ def parse_page(html, base_url):
     return article_data, links
 
 # Function to save the data to a JSON file
-def save_data(data, filename='articles.json'):
+def save_data(data, filename='scraped_data.csv'):
     with open(filename, 'a', encoding='utf-8') as f:
         json.dump(data, f, ensure_ascii=False)
         f.write('\n')  # Write each JSON object on a new line
