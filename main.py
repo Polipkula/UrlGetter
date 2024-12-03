@@ -1,87 +1,180 @@
 import requests
 from bs4 import BeautifulSoup
-from collections import deque
-import json
-import time
-from urllib.parse import urljoin
+import csv
+import os
+from concurrent.futures import ThreadPoolExecutor
 
-# Function to download the page content
-def fetch_page(url):
+# Konfigurace sběru dat pro více stránek
+START_URLS = [
+    "https://www.idnes.cz",  # iDnes.cz
+]
+
+MAX_URLS = 5000  # Maximální počet URL k prozkoumání
+OUTPUT_FILE = "scraped_data.csv"
+MAX_FILE_SIZE = 2 * 1024 * 1024 * 1024  # 2 GB
+
+# Optimalizace: Použití session pro znovupoužití spojení
+session = requests.Session()
+
+
+# Funkce pro sběr URL článků
+def collect_article_urls(base_url):
+    """Sbírá odkazy na články z dané domény."""
+    collected_urls = set()
+    to_visit = [base_url]
+    visited_urls = set()
+
+    print(f"Starting URL collection from: {base_url}")
+
+    while to_visit and len(collected_urls) < MAX_URLS:
+        current_url = to_visit.pop(0)
+        if current_url in visited_urls:
+            continue
+        visited_urls.add(current_url)
+
+        print(f"Visiting URL: {current_url} | Collected so far: {len(collected_urls)}")
+
+        try:
+            response = session.get(current_url, timeout=10)
+            response.raise_for_status()
+            soup = BeautifulSoup(response.text, 'html.parser')
+
+            # Vyhledávání všech odkazů na články
+            for link in soup.find_all('a', href=True):
+                url = link['href']
+                full_url = url if url.startswith("http") else f"{base_url}{url}"
+                if base_url in full_url and full_url not in collected_urls:
+                    collected_urls.add(full_url)
+                    to_visit.append(full_url)
+        except Exception as e:
+            print(f"Error collecting URLs from {current_url}: {e}")
+
+    print(f"Finished URL collection from: {base_url} | Total collected: {len(collected_urls)}")
+    return list(collected_urls)
+
+
+# Funkce pro stahování dat z článků
+def scrape_article(url):
+    """Stahuje obsah článku."""
+    print(f"Scraping article: {url}")
+
     try:
-        # Send a GET request to the URL with a timeout of 10 seconds
-        response = requests.get(url, timeout=10)
-        response.raise_for_status()  # Raise an error if the request failed
-        return response.text  # Return the page content
-    except requests.RequestException as e:
-        # Print an error message if there was an issue fetching the page
-        print(f"Error fetching {url}: {e}")
+        response = session.get(url, timeout=10)
+        response.raise_for_status()
+
+        if not response.text.strip():
+            print(f"Skipping empty page: {url}")
+            return None
+
+        soup = BeautifulSoup(response.text, 'html.parser')
+
+        # Titulek článku
+        title = soup.find('h1').get_text(strip=True) if soup.find('h1') else 'No title'
+
+        # Obsah článku
+        content = ' '.join([p.get_text(strip=True) for p in soup.find_all('p')])
+
+        # Počet obrázků
+        images = len(soup.find_all('img'))
+
+        # Kategorie článku
+        category = soup.find('meta', {'property': 'article:section'})
+        category = category['content'] if category else 'No category'
+
+        # Počet komentářů
+        comments = soup.find('a', {'class': 'comments-link'})
+        comments_count = comments.get_text(strip=True) if comments else 'No comments'
+
+        # Datum publikace
+        date = soup.find('meta', {'property': 'article:published_time'})
+        date = date['content'] if date else 'No date'
+
+        if not content.strip():
+            print(f"Skipping empty article content: {url}")
+            return None
+
+        return {
+            "url": url,
+            "title": title,
+            "content": content,
+            "images": images,
+            "category": category,
+            "comments_count": comments_count,
+            "date": date,
+        }
+    except requests.exceptions.RequestException as e:
+        print(f"Error scraping {url}: {e}")
+        return None
+    except Exception as e:
+        print(f"Unexpected error scraping {url}: {e}")
         return None
 
-# Function to parse the page content
-def parse_page(html, base_url):
-    soup = BeautifulSoup(html, 'html.parser')
-    article_data = {}
-    
-    # Extract the title of the article, assuming it's in an <h1> tag
-    title_tag = soup.find('h1')
-    if title_tag:
-        article_data['title'] = title_tag.get_text(strip=True)
-    
-    # Extract the date of the article, assuming it's in a <time> tag
-    date_tag = soup.find('time')
-    if date_tag:
-        article_data['date'] = date_tag.get('datetime')
-    
-    # Extract the full article content from the div with id="content"
-    content_div = soup.find('div', id='content')
-    if content_div:
-        article_data['content'] = content_div.get_text(strip=True)
-    
-    # Count the number of images in the article
-    img_tags = content_div.find_all('img') if content_div else []
-    article_data['img_count'] = len(img_tags)
 
-    # Find all links on the page (anchor tags with href attributes)
-    links = [urljoin(base_url, a.get('href')) for a in soup.find_all('a', href=True)]
-    return article_data, links
+# Funkce na zjištění velikosti výstupního souboru
+def get_file_size_in_gb(filename):
+    if os.path.exists(filename):
+        return os.path.getsize(filename) / (1024 ** 3)  # Převod na GB
+    return 0
 
-# Function to save the data to a JSON file
-def save_data(data, filename='scraped_data.csv'):
-    with open(filename, 'a', encoding='utf-8') as f:
-        json.dump(data, f, ensure_ascii=False)
-        f.write('\n')  # Write each JSON object on a new line
 
-# Main function to run the crawler
-def crawl(start_url, max_pages=100):
-    queue = deque([start_url])  # Queue to manage URLs to be visited
-    visited = set()  # Set to keep track of visited URLs
-    
-    while queue and len(visited) < max_pages:
-        current_url = queue.popleft()  # Get the next URL from the queue
-        if current_url in visited:
-            continue  # Skip if the URL has already been visited
+# Paralelní zpracování URL
+def scrape_multiple_urls_parallel(urls, batch_size=100):
+    results = []
+    total_urls = len(urls)
+    with ThreadPoolExecutor(max_workers=10) as executor:
+        for i in range(0, total_urls, batch_size):
+            batch = urls[i:i + batch_size]
+            print(f"Scraping batch {i // batch_size + 1} | URLs {i + 1}-{min(i + batch_size, total_urls)}")
+            batch_results = list(executor.map(scrape_article, batch))
+            batch_results = [res for res in batch_results if res]  # Odstraň prázdné výsledky
 
-        print(f"Crawling: {current_url}")
-        html = fetch_page(current_url)  # Fetch the page content
-        if html is None:
-            continue  # Skip to the next URL if the page couldn't be fetched
+            # Uložíme po každém batchi, aby se minimalizovala ztráta dat
+            save_to_csv(batch_results, OUTPUT_FILE)
 
-        article_data, links = parse_page(html, current_url)  # Parse the page content
-        if article_data:
-            save_data(article_data)  # Save the extracted article data
+            # Zalogujeme velikost souboru
+            current_file_size_gb = get_file_size_in_gb(OUTPUT_FILE)
+            print(f"Current collected data size: {current_file_size_gb:.2f} GB")
+            if current_file_size_gb >= MAX_FILE_SIZE / (1024 ** 3):
+                print(f"Reached file size limit of {MAX_FILE_SIZE / (1024 ** 3):.2f} GB. Stopping scraping.")
+                break
+    return results
 
-        visited.add(current_url)  # Mark the current URL as visited
-        for link in links:
-            # Add new links to the queue if they haven't been visited
-            if link not in visited and link.startswith(('http://', 'https://')):
-                queue.append(link)
-        
-        time.sleep(1)  # Pause for 1 second between requests to avoid overwhelming the server
 
+# Ukládání dat do CSV
+def save_to_csv(data, filename):
+    if not data:
+        print("No data to save!")
+        return
+
+    file_exists = os.path.exists(filename)
+
+    with open(filename, mode='a', encoding='utf-8', newline='') as file:
+        writer = csv.DictWriter(file, fieldnames=data[0].keys())
+        if not file_exists:
+            writer.writeheader()
+        writer.writerows(data)
+    print(f"Data successfully saved to {filename}. Current size: {get_file_size_in_gb(filename):.2f} GB")
+
+
+# Hlavní program
 if __name__ == "__main__":
-    # List of starting URLs for the crawler
-    start_urls = [
-        "https://www.idnes.cz"
-    ]
-    for url in start_urls:
-        crawl(url, max_pages=500)  # Start crawling each URL with a maximum of 500 pages
+    all_collected_urls = []
+
+    # Sbíráme URL z více stránek
+    for start_url in START_URLS:
+        print(f"Collecting URLs from {start_url}...")
+        urls = collect_article_urls(start_url)
+        all_collected_urls.extend(urls)
+        print(f"Collected {len(urls)} URLs from {start_url}")
+
+    # Filtrujeme duplicity
+    all_collected_urls = list(set(all_collected_urls))
+    print(f"Total collected unique URLs: {len(all_collected_urls)}")
+
+    # Sbíráme data z článků
+    print("Scraping data from articles...")
+    scrape_multiple_urls_parallel(all_collected_urls)
+
+    # Konečné shrnutí
+    final_file_size_gb = get_file_size_in_gb(OUTPUT_FILE)
+    print(f"Scraping completed. Total data collected: {final_file_size_gb:.2f} GB")
